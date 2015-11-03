@@ -1,5 +1,7 @@
 #include <stdint.h>
+#include <assert.h>
 #include "util.h"
+#include "jit-x64-opt-inc.h"
 
 |.arch x64
 |.actionlist actions
@@ -21,90 +23,25 @@
 
 #define Dst &state
 #define MAX_NESTING 256
+#define MAX_DATA 256
+
+dasm_State *state;
+unsigned int maxpc = 0;
+int pcstack[MAX_NESTING];
+int *top = pcstack, *limit = pcstack + MAX_NESTING;
+char *p;
 
 int main(int argc, char *argv[])
 {
 	if (argc < 2) err("Usage: jit-x64 <inputfile>");
-	dasm_State *state;
 	initjit(&state, actions);
-
-	unsigned int maxpc = 0;
-	int pcstack[MAX_NESTING];
-	int *top = pcstack, *limit = pcstack + MAX_NESTING;
 
 	// Function prologue.
 	|  push PTR
 	|  mov  PTR, rdi      // rdi store 1st argument
 
-	for (char *p = read_file(argv[1]); *p; p++) {
-        int count = 0;
-		switch (*p) {
-		case '>':
-		case '<':
-            do
-            {
-                if (*p == '>')
-                    ++count;
-                else
-                    --count;
-
-                ++p;
-            } while (*p == '>' || *p == '<');
-            --p;
-            
-            if (count > 0)
-                |  add  PTR, count
-            else if (count < 0)
-                |  sub  PTR, -count
-			break;
-		case '+':
-		case '-':
-            do
-            {
-                if (*p == '+')
-                    ++count;
-                else
-                    --count;
-
-                ++p;
-            } while (*p == '+' || *p == '-');
-            --p;
-            
-            if (count > 0)
-                |  add  byte [PTR], count
-            else if (count < 0)
-                |  sub  byte [PTR], -count
-			break;
-		case '.':
-			|  movzx edi, byte [PTR]
-			|  callp putchar
-			break;
-		case ',':
-			|  callp getchar
-			|  mov   byte [PTR], al
-			break;
-		case '[':
-			if (top == limit) err("Nesting too deep.");
-			// Each loop gets two pclabels: at the beginning and end.
-			// We store pclabel offsets in a stack to link the loop
-			// begin and end together.
-			maxpc += 2;
-			*top = maxpc;
-            top++;
-			dasm_growpc(&state, maxpc);
-			|  cmp  byte [PTR], 0
-			|  je   =>(maxpc-2)
-			|=>(maxpc-1):
-			break;
-		case ']':
-			if (top == pcstack) err("Unmatched ']'");
-			top--;
-			|  cmp  byte [PTR], 0
-			|  jne  =>(*top-1)
-			|=>(*top-2):
-			break;
-		}
-	}
+	p = read_file(argv[1]);
+	compile();
 
 	// Function epilogue.
 	|  pop  PTR
@@ -116,4 +53,242 @@ int main(int argc, char *argv[])
 	free(mem);
 	free_jitcode(fptr);
 	return 0;
+}
+
+DataState *create(int offset)
+{
+    DataState *tmp = (DataState *) malloc(sizeof(DataState));
+    tmp->offset = offset;
+    tmp->diff = tmp->totalDiff = 0;
+    tmp->predict = 1;
+    return tmp;
+}
+
+DataState *find(int offset, DataState *data[], int sizeOfData)
+{
+    for (int i = 0; i < sizeOfData; ++i)
+    {
+        if(data[i]->offset == offset)
+            return data[i];
+    }
+
+    return NULL;
+}
+
+void inc(int offset, DataState *(*data)[], int *sizeOfData)
+{
+    DataState *tmp = find(offset, *data, *sizeOfData);
+    if (tmp == NULL)
+        tmp = (*data)[(*sizeOfData)++] = create(offset);
+
+    ++(tmp->diff);
+    ++(tmp->totalDiff);
+}
+
+void dec(int offset, DataState *(*data)[], int *sizeOfData)
+{
+    DataState *tmp = find(offset, *data, *sizeOfData);
+    if (tmp == NULL)
+        tmp = (*data)[(*sizeOfData)++] = create(offset);
+
+    --(tmp->diff);
+    --(tmp->totalDiff);
+}
+
+void movPtr(int from, int to) {
+    int def = from - to;
+    if (def < 0)
+        | add  PTR, -def
+    else if (def > 0)
+        | sub  PTR, def
+}
+
+void genLoops(int *ptr, DataState *(*data)[], int *sizeOfData, DataState *cond)
+{
+    movPtr(0, cond->offset);
+    int curPtr = cond->offset;
+
+    if (cond->totalDiff != -1)
+    {
+        | mov  al, byte [PTR]
+        | mov  ah, 0
+        | mov  cl, -cond->totalDiff
+        | idiv cl
+        | mov  cl, al
+        
+    }    
+    else
+        | mov  cl, byte [PTR]
+
+    for (int i = 0; i < *sizeOfData; ++i)
+    {
+        DataState *dataState = (*data)[i];
+        if (dataState == cond)
+        {
+            movPtr(curPtr, dataState->offset);
+            curPtr = dataState->offset;
+            | mov  byte [PTR], 0
+
+        }
+        else if (dataState->diff != 0)
+        {
+            movPtr(curPtr, dataState->offset);
+            curPtr = dataState->offset;
+            | mov al, (dataState->diff)
+            | imul cl
+            | add  byte [PTR], al
+        }
+
+        if (dataState != NULL)
+        {
+            free(dataState);
+            (*data)[i] = NULL;
+        }
+    }
+
+    movPtr(curPtr, *ptr);
+    *ptr = 0;
+    *sizeOfData = 0;
+}
+
+void genAll(int *ptr, DataState *(*data)[], int *sizeOfData)
+{
+    int curPtr = 0;
+    for (int i = 0; i < *sizeOfData; ++i)
+    {
+        DataState *dataState = (*data)[i];
+        if (dataState->diff != 0)
+        {
+            movPtr(curPtr, dataState->offset);
+            curPtr = dataState->offset;
+                
+            if (dataState->diff > 0)
+                | add  byte [PTR], dataState->diff
+            else
+                | sub  byte [PTR], -dataState->diff
+        }
+        free((*data)[i]);
+        (*data)[i] = NULL;
+    }
+
+    movPtr(curPtr, *ptr);
+    *ptr = 0;
+    *sizeOfData = 0;
+}
+
+void getPtr(int ptr, DataState *(*data)[], int *sizeOfData)
+{
+    movPtr(0, ptr);
+
+    DataState *tmp = find(ptr, *data, *sizeOfData);
+    if (tmp == NULL)
+        tmp = (*data)[(*sizeOfData)++] = create(ptr);
+
+    tmp->diff = tmp->totalDiff = tmp->predict = 0;
+
+    |  callp getchar
+	|  mov   byte [PTR], al
+    movPtr(ptr, 0);
+}
+
+void putPtr(int ptr, DataState *(*data)[], int *sizeOfData)
+{
+    movPtr(0, ptr);
+
+    DataState *tmp = find(ptr, *data, *sizeOfData);
+    if (tmp != NULL && tmp->diff != 0)
+    {
+        if (tmp->diff > 0)
+            | add  byte [PTR], tmp->diff
+        else
+            | sub  byte [PTR], -tmp->diff
+
+        tmp->diff = 0;
+    }
+
+    |  movzx edi, byte [PTR]
+    |  callp putchar
+    movPtr(ptr, 0);
+}
+
+void compile()
+{
+    int predict = 1;
+    int ptr = 0;
+    DataState *data[MAX_DATA], *tmp;
+    int sizeOfData = 0;
+
+	for (; *p; p++) 
+    {
+
+		switch (*p) {
+		case '>':
+            ++ptr;
+            break;
+
+		case '<':
+            --ptr;
+            break;
+
+		case '+':
+            inc(ptr, &data, &sizeOfData);
+            break;
+
+		case '-':
+            dec(ptr, &data, &sizeOfData);
+            break;
+
+		case '.':
+            putPtr(ptr, &data, &sizeOfData);
+            predict = 0;
+			break;
+
+		case ',':
+            getPtr(ptr, &data, &sizeOfData);
+            predict = 0;
+			break;
+
+		case '[':
+            genAll(&ptr, &data, &sizeOfData);
+            predict = 0;
+
+            maxpc += 2;
+            *top = maxpc;
+            top++;
+            dasm_growpc(&state, maxpc);
+            |  cmp  byte [PTR], 0
+            |  je   =>(maxpc-2)
+            |=>(maxpc-1):
+
+            (*p)++;
+            compile();
+			break;
+
+		case ']':
+            (*p)++;
+
+            if (predict && ptr == 0)
+            {
+                tmp = find(ptr, data, sizeOfData);
+                if (tmp != NULL && tmp->predict && tmp->totalDiff < 0)
+                {
+                    genLoops(&ptr, &data, &sizeOfData, tmp);
+                    top--;
+                    |=>(*top-2):
+                    return;
+                }
+            }
+
+            genAll(&ptr, &data, &sizeOfData);
+            top--;
+            |  cmp  byte [PTR], 0
+            |  jne  =>(*top-1)
+            |=>(*top-2):
+			return ;
+		}
+	}
+
+    genAll(&ptr, &data, &sizeOfData);
+
+    return ;
 }
