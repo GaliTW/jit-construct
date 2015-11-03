@@ -34,8 +34,10 @@ make run-compiler
 ###The JIT
 ```
 make run-jit-x64
+make run-jit-x64-opt
 make run-jit-arm
 make bench-jit-x64
+make bench-jit-x64-opt
 ```
 
 ##License
